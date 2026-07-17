@@ -1,0 +1,8 @@
+# 统一按 LF 检出所有文本文件，避免 Windows 上 CRLF 让字节级测试断言失败。
+* text=auto eol=lf
+
+# 该静态文件在测试里被逐字节断言，显式钉死为 LF（否则 Windows 检出会变成 28 字节）。
+static/hello.txt text eol=lf
+
+# PowerShell 脚本按 LF 即可，PowerShell 5+ 能正确解析 LF。
+*.ps1 text eol=lf

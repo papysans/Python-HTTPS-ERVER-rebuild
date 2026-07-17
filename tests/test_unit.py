@@ -228,12 +228,24 @@ def test_resolve_static_path_blocks_escapes(tmp_path, url_path):
     assert resolve_static_path(root.resolve(), url_path) is None
 
 
+def _symlink_or_skip(link, target) -> None:
+    """创建符号链接；若当前平台/权限不允许则跳过测试。
+
+    Windows 默认账户无建符号链接权限，os.symlink 会抛 OSError；
+    开启「开发者模式」或以管理员身份运行后即可执行本用例。
+    """
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"当前环境不支持创建符号链接（Windows 需开启开发者模式）：{exc}")
+
+
 def test_resolve_static_path_blocks_symlink_escape(tmp_path):
     root = tmp_path / "static"
     root.mkdir()
     outside = tmp_path / "secret.txt"
     outside.write_text("secret")
-    (root / "link.txt").symlink_to(outside)
+    _symlink_or_skip(root / "link.txt", outside)
 
     assert resolve_static_path(root.resolve(), "/static/link.txt") is None
 

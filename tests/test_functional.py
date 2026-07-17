@@ -27,6 +27,7 @@ from http_server import HttpServer
 
 
 ROOT = Path(__file__).resolve().parents[1]
+STATIC_HELLO = ROOT / "static" / "hello.txt"
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -57,14 +58,28 @@ def address():
             loop.run_until_complete(server.serve_forever())
         except (asyncio.CancelledError, RuntimeError):
             pass
+        finally:
+            # 让 serve_forever 的 finally（关闭监听 socket、取消并 gather 在飞连接）
+            # 全部跑完后，再收尾异步生成器并关闭事件循环，避免留下未 await 的 pending task。
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            finally:
+                loop.close()
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     try:
         yield host, port
     finally:
-        loop.call_soon_threadsafe(loop.stop)
-        thread.join(timeout=3)
+        # 用取消（而非 loop.stop）触发 serve_forever 的清理路径：
+        # cancel 会在 sock_accept 处抛出 CancelledError，其 finally 里的 close()
+        # 得以关闭 socket 并等待在飞连接收尾，因此不再有 "Task was destroyed" 警告。
+        def _cancel_all() -> None:
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
+
+        loop.call_soon_threadsafe(_cancel_all)
+        thread.join(timeout=5)
 
 
 @pytest.fixture
@@ -121,7 +136,9 @@ def test_static_file_is_served(opener, base_url):
 
     assert response.status == 200
     assert response.headers["Content-Type"] == "text/plain"
-    assert body == b"hello\nthis is a static file"
+    # 按磁盘上的实际字节比较，而非写死 LF 版本：
+    # Windows 检出若把 hello.txt 变成 CRLF，服务器返回的也应是同一份字节。
+    assert body == STATIC_HELLO.read_bytes()
 
 
 def test_sum_api_accepts_query_string_numbers(opener, base_url):
@@ -264,8 +281,9 @@ def test_head_request_omits_body_but_keeps_content_length(address):
     raw = raw_request(address, b"HEAD /static/hello.txt HTTP/1.1\r\nHost: x\r\n\r\n")
 
     head, _, body = raw.partition(b"\r\n\r\n")
+    expected_length = len(STATIC_HELLO.read_bytes())  # 由文件实际字节数决定，不写死
     assert b"200 OK" in head
-    assert b"Content-Length: 27" in head
+    assert f"Content-Length: {expected_length}".encode() in head
     assert body == b""
 
 

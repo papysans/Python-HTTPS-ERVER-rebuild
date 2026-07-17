@@ -5,9 +5,16 @@
 它的来历：原本是一份刻意写成「能跑，但难维护、难测试」的单文件代码（426 行），作为编码风格练习的反面教材。本仓库是对它做完整代码评审后的重构产物——**代码本身只是结果，`docs/` 里的评审与重构过程才是重点**。
 
 ```bash
-./run-tests.sh
-# 61 passed in 0.10s
+./run-tests.sh          # Linux / macOS
 ```
+```powershell
+.\run-tests.ps1         # Windows (PowerShell)
+```
+```
+61 passed
+```
+
+两端结果一致：`static/hello.txt` 已通过 `.gitattributes` 钉死为 LF，且字节级断言按文件实际字节计算，不受 Windows CRLF 影响。符号链接用例在无权限的 Windows 上会自动 `skip`（开启开发者模式后可跑）。
 
 ## 功能
 
@@ -24,6 +31,8 @@ python3 http_server.py                 # 监听 127.0.0.1:8080
 python3 http_server.py --port 0        # 由内核分配端口
 python3 http_server.py --log-level DEBUG
 ```
+
+Windows 上把 `python3` 换成 `python` 或 `py` 即可，例如 `py http_server.py --port 0`。
 
 ## 模块结构
 
@@ -93,4 +102,6 @@ if len(sec) > 0:          # len(None) → TypeError
 
 ## 环境
 
-Python 3.10+（在 3.14.5 / macOS 上验证）。测试需要 `pytest`，其余仅用标准库。
+Python 3.10+。测试需要 `pytest`，其余仅用标准库。
+
+跨平台：在 macOS 与 Windows 上均验证 61 项全部通过（Windows 下符号链接用例若无权限会 `skip`，需开启开发者模式或以管理员身份运行才会执行）。所有文本文件经 `.gitattributes` 统一按 LF 检出，字节级测试断言按文件实际字节计算，因此行尾差异不会影响测试结果。
