@@ -256,9 +256,14 @@ class Router:
 
         username = request.form.get("username", [""])[0]
         password = request.form.get("password", [""])[0]
-        # compare_digest 避免按字符提前返回的时序差异
-        username_ok = _secrets.compare_digest(username, self._config.username)
-        password_ok = _secrets.compare_digest(password, self._config.password)
+        # compare_digest 避免按字符提前返回的时序差异。但它对 str 只支持 ASCII，
+        # 客户端提交中文等非 ASCII 凭据会抛 TypeError（被顶层伪装成 500）。
+        # 先统一编码为 UTF-8 bytes 再比较：bytes 版对任意字节都成立。
+        def _const_eq(a: str, b: str) -> bool:
+            return _secrets.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+        username_ok = _const_eq(username, self._config.username)
+        password_ok = _const_eq(password, self._config.password)
         if not (username_ok and password_ok):
             logger.warning("failed login attempt for username=%r", username)
             return html_response(
@@ -296,7 +301,16 @@ class Router:
             return error_response(HTTPStatus.FORBIDDEN, "forbidden")
 
         if path.is_dir():
-            path = path / "index.html"
+            # 追加目录 index 后必须再次 resolve + 校验归属：resolve_static_path
+            # 只验证了目录本身在根内，若该目录下的 index.html 是指向根外文件的
+            # 符号链接，is_file()/read_bytes() 会跟随它逃出静态根目录。
+            index = (path / "index.html").resolve()
+            try:
+                index.relative_to(self._config.static_root)
+            except ValueError:
+                logger.warning("blocked static index symlink escape: %r", request.path)
+                return error_response(HTTPStatus.FORBIDDEN, "forbidden")
+            path = index
         if not path.is_file():
             return error_response(HTTPStatus.NOT_FOUND, "not found")
 

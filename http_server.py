@@ -38,8 +38,6 @@ from sessions import SessionStore
 logger = logging.getLogger("http_server")
 
 RECV_CHUNK_BYTES = 4096
-# 无并发上限时，攻击者可无成本地把 task 与 fd 撑爆
-MAX_CONCURRENT_CONNECTIONS = 256
 
 
 async def read_request(client: socket.socket, config: ServerConfig) -> Request:
@@ -53,21 +51,30 @@ async def read_request(client: socket.socket, config: ServerConfig) -> Request:
     """
     loop = asyncio.get_running_loop()
 
+    def too_large() -> HttpError:
+        return HttpError(
+            431,
+            "Request Header Fields Too Large",
+            "request header fields too large",
+            log_message=f"head exceeded {config.max_header_bytes} bytes",
+        )
+
     data = b""
     while b"\r\n\r\n" not in data:
+        # 尚未见到头结束符时 data 全是头部，可据此判超限；
+        # 检查放在 recv 之前，避免把同一次 recv 里携带的 body 计进头部长度。
+        if len(data) > config.max_header_bytes:
+            raise too_large()
         chunk = await loop.sock_recv(client, RECV_CHUNK_BYTES)
         if not chunk:
             raise BadRequest(log_message="connection closed before request head was complete")
         data += chunk
-        if len(data) > config.max_header_bytes:
-            raise HttpError(
-                431,
-                "Request Header Fields Too Large",
-                "request header fields too large",
-                log_message=f"head exceeded {config.max_header_bytes} bytes",
-            )
 
     head, _, body = data.partition(b"\r\n\r\n")
+    if len(head) > config.max_header_bytes:
+        # 只按头部实际长度判断：合法请求的 body 恰好和头在同一次 recv 到达时
+        # 不应被误报 431。
+        raise too_large()
     method, target, version, headers = parse_head(head)
     content_length = parse_content_length(headers, config.max_body_bytes)
 
@@ -106,32 +113,41 @@ class ConnectionHandler:
 
     async def handle(self, client: socket.socket, address: tuple[str, int]) -> None:
         started_at = time.monotonic()
+        exchange: Optional[Exchange] = None
+        # client.close() 放在最外层 finally：CancelledError 不是 Exception，
+        # 若在读请求/路由/等待期间被取消，控制流不会进入发送阶段，socket 必须
+        # 仍被关闭（否则关停/重启时 fd 泄漏）。
         try:
-            exchange = await self._build_exchange(client, address)
-        except Exception:
-            logger.exception("unhandled error while serving %s", address)
-            exchange = Exchange(
-                error_response(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error")
-            )
+            try:
+                exchange = await self._build_exchange(client, address)
+            except Exception:
+                logger.exception("unhandled error while serving %s", address)
+                exchange = Exchange(
+                    error_response(HTTPStatus.INTERNAL_SERVER_ERROR, "internal server error")
+                )
 
-        try:
             payload = exchange.response.to_bytes(http_date(), include_body=exchange.include_body)
-            await asyncio.wait_for(
-                asyncio.get_running_loop().sock_sendall(client, payload),
-                timeout=self._config.read_timeout_seconds,
-            )
-        except (asyncio.TimeoutError, OSError) as exc:
-            logger.warning("failed to send response to %s: %s", address, exc)
+            try:
+                await asyncio.wait_for(
+                    asyncio.get_running_loop().sock_sendall(client, payload),
+                    timeout=self._config.read_timeout_seconds,
+                )
+            except (asyncio.TimeoutError, OSError) as exc:
+                logger.warning("failed to send response to %s: %s", address, exc)
         finally:
             client.close()
-            logger.info(
-                "%s %s %s -> %d (%.1f ms)",
-                address[0],
-                exchange.method,
-                exchange.path,
-                exchange.response.status,
-                (time.monotonic() - started_at) * 1000,
-            )
+            elapsed_ms = (time.monotonic() - started_at) * 1000
+            if exchange is not None:
+                logger.info(
+                    "%s %s %s -> %d (%.1f ms)",
+                    address[0],
+                    exchange.method,
+                    exchange.path,
+                    exchange.response.status,
+                    elapsed_ms,
+                )
+            else:
+                logger.info("%s connection closed before response (%.1f ms)", address[0], elapsed_ms)
 
     async def _build_exchange(self, client: socket.socket, address: tuple[str, int]) -> Exchange:
         try:
@@ -255,22 +271,35 @@ class HttpServer:
 
     async def serve_forever(self) -> None:
         assert self._socket is not None, "call start() first"
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
+        semaphore = asyncio.Semaphore(self._config.max_concurrent_connections)
         loop = asyncio.get_running_loop()
 
         async def serve_one(client: socket.socket, address: tuple[str, int]) -> None:
-            async with semaphore:
+            try:
                 await self._handler.handle(client, address)
+            finally:
+                semaphore.release()
 
         try:
             while True:
-                client, address = await loop.sock_accept(self._socket)
+                # 先取许可再 accept：达到上限时停止摘取新连接（背压交给内核 backlog），
+                # 而不是原来的「无限 accept 后在 handler 里排队」——那样已接受的 socket
+                # 与 task 仍会无上限堆积，攻击者可低成本耗尽 fd/内存。
+                await semaphore.acquire()
+                try:
+                    client, address = await loop.sock_accept(self._socket)
+                except BaseException:
+                    # 包含 CancelledError：accept 未成功，必须归还刚取的许可
+                    semaphore.release()
+                    raise
                 try:
                     client.setblocking(False)
                 except OSError:
                     client.close()
+                    semaphore.release()
                     continue
-                # asyncio 只持弱引用，不留强引用的 task 可能被 GC 中途回收
+                # asyncio 只持弱引用，不留强引用的 task 可能被 GC 中途回收。
+                # 许可由 serve_one 的 finally 释放。
                 task = asyncio.create_task(serve_one(client, address))
                 self._pending.add(task)
                 task.add_done_callback(self._pending.discard)

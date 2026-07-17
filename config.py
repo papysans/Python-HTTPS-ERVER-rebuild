@@ -23,6 +23,10 @@ class ServerConfig:
     # 无此超时则连接可被永久占用（slowloris）
     read_timeout_seconds: float = 15.0
 
+    # 同时在处理的连接上限。放进配置便于边界测试与部署调节，
+    # 也是 accept 前获取许可（背压）所依据的值。
+    max_concurrent_connections: int = 256
+
     session_cookie: str = "sid"
     session_max_age_seconds: int = 60 * 60
     # 原代码的 SESSIONS 无上限，匿名请求可无限撑大内存

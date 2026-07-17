@@ -6,12 +6,14 @@
 """
 
 import asyncio
+import socket
 
 import pytest
 
 from config import ServerConfig
 from handlers import (
     Router,
+    error_response,
     extract_params,
     parse_int_list,
     parse_sleep_seconds,
@@ -29,6 +31,7 @@ from http_core import (
     parse_head,
     parse_request,
 )
+from http_server import ConnectionHandler, read_request
 from sessions import SessionStore
 
 
@@ -407,3 +410,185 @@ def test_unknown_path_returns_404():
     request = Request("GET", "/nope", "HTTP/1.1", {}, b"", path="/nope")
 
     assert dispatch(make_router([]), request).status == 404
+
+
+# ==========================================================================
+# 第二轮复审（Codex high）发现并修复的缺陷 —— 回归测试
+# ==========================================================================
+
+
+def test_parse_content_length_rejects_empty_value():
+    """R04：头存在但值为空，不能等同于「头不存在」当成 0（否则带 body 的报文被当无 body）。"""
+    with pytest.raises(BadRequest):
+        parse_content_length({"content-length": ""}, max_body_bytes=1024)
+
+
+def test_parse_content_length_absent_header_means_zero():
+    assert parse_content_length({}, max_body_bytes=1024) == 0
+
+
+@pytest.mark.parametrize("value", ["²", "³", "٣", "০"])
+def test_parse_content_length_rejects_non_ascii_digits(value):
+    """R05：str.isdigit() 对上标/他国数字返回 True，但 int() 未必能解析（'²' 抛 ValueError）。"""
+    with pytest.raises(BadRequest):
+        parse_content_length({"content-length": value}, max_body_bytes=1024)
+
+
+def test_parse_content_length_rejects_absurdly_long_number():
+    """R05：>4300 位数字会让 int() 直接抛异常，应按位数提前判过大而非泄漏 ValueError。"""
+    with pytest.raises(PayloadTooLarge):
+        parse_content_length({"content-length": "9" * 5000}, max_body_bytes=10**9)
+
+
+def test_parse_headers_rejects_whitespace_before_colon():
+    """R06：'Content-Length : 5' 会被前置代理与本服务不一致地解析，构成走私面。"""
+    with pytest.raises(BadRequest):
+        parse_head(b"GET / HTTP/1.1\r\nHost: x\r\nContent-Length : 5")
+
+
+def test_response_control_headers_are_case_insensitive():
+    """R07：HTTP 头名大小写不敏感，但 dict 键敏感。handler 设小写 content-length
+    不得与框架的并存（响应走私），设 X-Content-Type-Options 不得覆盖 nosniff。
+    """
+    raw = Response(
+        headers={"content-length": "999", "X-Content-Type-Options": "off"},
+        body=b"hello",
+    ).to_bytes()
+
+    assert raw.lower().count(b"content-length:") == 1
+    assert b"Content-Length: 5" in raw
+    assert b"nosniff" in raw
+
+
+def test_parse_head_requires_host_for_http_1_1():
+    """R14：HTTP/1.1 必须携带 Host。"""
+    with pytest.raises(BadRequest):
+        parse_head(b"GET / HTTP/1.1\r\n")
+
+
+def test_parse_head_allows_missing_host_for_http_1_0():
+    method, _, version, headers = parse_head(b"GET / HTTP/1.0\r\n")
+    assert method == "GET" and version == "HTTP/1.0" and headers == {}
+
+
+def test_rotate_id_of_expired_session_returns_fresh_session():
+    """R12：对已过期会话 rotate 不应把旧 last_seen 带进新 id（否则新 id 立即过期）。"""
+    clock = FakeClock()
+    store = make_store(clock, max_age=10)
+    old_id, _ = store.create()
+
+    clock.now += 11  # 过期
+    new_id = store.rotate_id(old_id)
+
+    assert store.get(new_id) is not None  # 新会话有效，不会一取就没
+
+
+def test_login_with_non_ascii_credentials_returns_401_not_500():
+    """R08：secrets.compare_digest 对非 ASCII str 抛 TypeError；改为 UTF-8 bytes 比较后
+    中文等凭据应正常判为 401，而不是被顶层伪装成 500。
+    """
+    router = Router(ServerConfig(), make_store(FakeClock()))
+    request = Request(
+        "POST", "/login", "HTTP/1.1", {}, b"",
+        path="/login", form={"username": ["管理员"], "password": ["密码"]},
+    )
+
+    response = asyncio.run(router.dispatch(request))
+
+    assert response.status == 401
+
+
+def test_static_nested_index_symlink_escape_is_blocked(tmp_path):
+    """R09：/static/<dir> 的 index.html 若是指向根外的符号链接，追加后必须再校验归属。"""
+    root = tmp_path / "static"
+    root.mkdir()
+    (tmp_path / "secret.txt").write_text("TOP SECRET")
+    sub = root / "docs"
+    sub.mkdir()
+    _symlink_or_skip(sub / "index.html", tmp_path / "secret.txt")
+
+    router = Router(ServerConfig(static_root=root.resolve()), make_store(FakeClock()))
+    request = Request("GET", "/static/docs", "HTTP/1.1", {}, b"", path="/static/docs")
+
+    response = asyncio.run(router.dispatch(request))
+
+    assert response.status == 403
+    assert b"TOP SECRET" not in response.body
+
+
+def test_read_request_does_not_miscount_body_as_oversized_header():
+    """R03：头与 body 在同一次 recv 到达时，头部上限只应按头部长度判断，不含 body。"""
+
+    async def drive() -> None:
+        left, right = socket.socketpair()
+        left.setblocking(False)
+        config = ServerConfig(max_header_bytes=100)  # 故意调小
+        head = b"POST /api/v1/sum HTTP/1.1\r\nHost: x\r\nContent-Length: 40\r\n\r\n"
+        body = b"numbers=" + b"1," * 16  # 40 字节
+        right.sendall(head + body[:40])
+        right.close()
+        try:
+            request = await read_request(left, config)
+            assert request.path == "/api/v1/sum"
+            assert len(request.body) == 40
+        finally:
+            left.close()
+
+    asyncio.run(drive())
+
+
+def test_read_request_still_rejects_truly_oversized_header():
+    """R03 反向：真正超长且无终止符的头部仍应触发 431。"""
+
+    async def drive() -> None:
+        left, right = socket.socketpair()
+        left.setblocking(False)
+        config = ServerConfig(max_header_bytes=100)
+        right.sendall(b"X" * 300)  # 无 CRLFCRLF
+        right.close()
+        try:
+            with pytest.raises(HttpError) as excinfo:
+                await read_request(left, config)
+            assert excinfo.value.status == 431
+        finally:
+            left.close()
+
+    asyncio.run(drive())
+
+
+def test_unexpected_handler_error_returns_fixed_500_without_leak():
+    """R16.3：真正走通用异常兜底路径——注入一个会抛异常的 handler，
+    断言返回固定 500 文案且不泄漏内部异常（原测试只触发了显式 400 校验）。
+    """
+
+    class BoomRouter:
+        async def dispatch(self, request):
+            raise RuntimeError("secret internal detail: /etc/shadow")
+
+    config = ServerConfig()
+    store = make_store(FakeClock())
+    handler = ConnectionHandler(config, BoomRouter(), store)
+
+    async def drive() -> bytes:
+        left, right = socket.socketpair()
+        left.setblocking(False)
+        right.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        await handler.handle(left, ("127.0.0.1", 12345))
+        right.setblocking(True)
+        right.settimeout(1)
+        data = b""
+        while True:
+            chunk = right.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        right.close()
+        left.close()
+        return data
+
+    raw = asyncio.run(drive())
+
+    assert b"500 Internal Server Error" in raw
+    assert b"internal server error" in raw
+    assert b"secret internal detail" not in raw  # 不泄漏异常原文
+    assert b"/etc/shadow" not in raw

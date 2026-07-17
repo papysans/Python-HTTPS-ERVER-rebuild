@@ -14,6 +14,7 @@ import asyncio
 import json
 import socket
 import threading
+import time
 from http.cookiejar import CookieJar
 from pathlib import Path
 from urllib.error import HTTPError
@@ -215,11 +216,15 @@ def test_protected_page_requires_login_and_accepts_hardcoded_credentials(opener,
 
 
 def test_sleep_without_param_uses_default_instead_of_crashing(opener, base_url):
-    """原代码：len(None) → TypeError → 400，默认值分支不可达。"""
-    response, body = request(opener, base_url, "/api/v1/sleep?sec=0")
+    """原代码：len(None) → TypeError → 400，默认值分支不可达。
+
+    这里真正发送不带 sec 的请求（原测试误发 sec=0，绕过了默认分支）；
+    无参默认睡 1 秒，故断言 {"sec": 1}。
+    """
+    response, body = request(opener, base_url, "/api/v1/sleep")
 
     assert response.status == 200
-    assert json_body(body) == {"sec": 0}
+    assert json_body(body) == {"sec": 1}
 
 
 def test_sleep_rejects_non_integer_with_structured_error(opener, base_url):
@@ -357,3 +362,77 @@ def test_homepage_does_not_expose_credentials(opener, base_url):
     _, body = request(opener, base_url, "/")
 
     assert b"password" not in body
+
+
+# ==========================================================================
+# 三、并发/连接生命周期（第二轮复审 R01/R02）
+# ==========================================================================
+
+
+def _run_server_in_loop(server):
+    """在独立线程的事件循环里跑 server，返回 (loop, thread, serve_task_holder)。"""
+    loop = asyncio.new_event_loop()
+    holder = {}
+
+    def run():
+        asyncio.set_event_loop(loop)
+        holder["task"] = loop.create_task(server.serve_forever())
+        try:
+            loop.run_until_complete(holder["task"])
+        except (asyncio.CancelledError, RuntimeError):
+            pass
+        finally:
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            finally:
+                loop.close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return loop, thread, holder
+
+
+def test_semaphore_bounds_accepted_connections():
+    """R01：并发上限必须在 accept 之前生效。
+
+    上限设为 1，开 3 个不发数据的连接；只应有 1 个被 accept 进 handler，
+    其余留在内核 backlog（原实现是 accept 后再排队，socket/task 会无上限堆积）。
+    """
+    config = ServerConfig(host="127.0.0.1", port=0, max_concurrent_connections=1)
+    server = HttpServer(config)
+    host, port = server.start()
+    loop, thread, holder = _run_server_in_loop(server)
+    clients = []
+    try:
+        for _ in range(3):
+            client = socket.create_connection((host, port))
+            clients.append(client)
+        time.sleep(0.4)  # 给 accept 循环时间推进
+        assert len(server._pending) <= 1
+    finally:
+        for client in clients:
+            client.close()
+        task = holder.get("task")
+        if task is not None:
+            loop.call_soon_threadsafe(task.cancel)
+        thread.join(timeout=5)
+
+
+def test_connection_socket_is_closed_when_task_cancelled():
+    """R02：读请求期间被取消（CancelledError 不是 Exception），socket 仍须关闭。"""
+    config = ServerConfig(host="127.0.0.1", port=0, max_concurrent_connections=10)
+    server = HttpServer(config)
+    host, port = server.start()
+    loop, thread, holder = _run_server_in_loop(server)
+    client = socket.create_connection((host, port))
+    try:
+        time.sleep(0.2)  # 连接已被 accept，handler 卡在读请求
+        task = holder.get("task")
+        if task is not None:
+            loop.call_soon_threadsafe(task.cancel)
+        thread.join(timeout=5)
+
+        client.settimeout(2)
+        assert client.recv(100) == b""  # 服务端已关闭连接 -> EOF
+    finally:
+        client.close()

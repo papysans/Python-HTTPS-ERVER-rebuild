@@ -50,11 +50,15 @@ class SessionStore:
         session = self._sessions.get(session_id)
         if session is None:
             return None
-        if self._clock() - session.get("last_seen", self._clock()) > self._max_age_seconds:
+        if self._is_expired(session):
             del self._sessions[session_id]
             logger.info("session expired on access, removed")
             return None
         return session
+
+    def _is_expired(self, session: dict) -> bool:
+        now = self._clock()
+        return now - session.get("last_seen", now) > self._max_age_seconds
 
     def touch(self, session_id: str) -> None:
         session = self._sessions.get(session_id)
@@ -80,7 +84,9 @@ class SessionStore:
         诱导受害者登录，随后凭同一个 sid 冒用其已认证会话。
         """
         session = self._sessions.pop(old_session_id, None)
-        if session is None:
+        # 旧会话不存在或已过期时，不应把它的旧 last_seen 带进新 id
+        # （否则返回的新 id 下一次 get 就立即过期）；直接建一个全新会话。
+        if session is None or self._is_expired(session):
             session_id, _ = self.create()
             return session_id
         self._evict_if_full()

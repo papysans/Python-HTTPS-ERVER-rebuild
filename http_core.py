@@ -79,16 +79,26 @@ class Response:
         相同的头（含 Content-Length），但不得发送实体内容。
 
         原代码把 `**self.headers` 展开在 Content-Length 之后，handler 一旦
-        设置了同名头就能覆盖真实长度；这里让框架头最后写入，不可被覆盖。
+        设置了同名头就能覆盖真实长度。但仅靠精确同名还不够：HTTP 头名大小写
+        不敏感，而 dict 键大小写敏感——handler 设一个小写 content-length 就能
+        与框架的 Content-Length 并存（出现两个长度头，构成响应走私），或用精确
+        大小写覆盖掉 nosniff。这里对框架控制头做大小写无关的强制：先剔除 handler
+        里与控制头同名（忽略大小写）的项，再统一写入可信值。
         """
-        headers = {
+        framework_headers = {
             "Server": "asyncio-socket-http",
             "X-Content-Type-Options": "nosniff",
-            **self.headers,
             "Date": date or http_date(),
             "Connection": "close",
             "Content-Length": str(len(self.body)),
         }
+        controlled = {name.casefold() for name in framework_headers}
+        headers = {
+            name: value
+            for name, value in self.headers.items()
+            if name.casefold() not in controlled
+        }
+        headers.update(framework_headers)
         head = [f"HTTP/1.1 {self.status} {self.reason}"]
         head.extend(f"{name}: {value}" for name, value in headers.items())
         head.extend(f"Set-Cookie: {cookie}" for cookie in self.cookies)
@@ -175,7 +185,12 @@ def parse_headers(head_lines: list[str]) -> dict[str, str]:
         if ":" not in line:
             raise BadRequest(log_message=f"malformed header line: {line!r}")
         name, value = line.split(":", 1)
-        name = name.strip().lower()
+        # 字段名与冒号之间不得有空白，字段行也不得以空白开头（obs-fold）：
+        # RFC 9112 §5.1 要求拒绝，否则前置代理可能忽略该头而本服务采用它，
+        # 两侧对消息边界的理解不一致，构成请求走私面。
+        if name != name.strip():
+            raise BadRequest(log_message=f"whitespace around header field name: {line!r}")
+        name = name.lower()
         value = value.strip()
         if name == "content-length" and name in headers and headers[name] != value:
             raise BadRequest(log_message=f"conflicting Content-Length: {headers[name]!r} vs {value!r}")
@@ -203,17 +218,23 @@ def parse_head(head: bytes) -> tuple[str, str, str, dict[str, str]]:
             "http version not supported",
             log_message=f"unsupported version: {version!r}",
         )
-    return method.upper(), target, version, parse_headers(lines[1:])
+    headers = parse_headers(lines[1:])
+    # HTTP/1.1 必须携带 Host（RFC 9112 §3.2）。缺失时若前置有多站点代理，
+    # 路由归属会产生歧义，因此显式拒绝。
+    if version == "HTTP/1.1" and "host" not in headers:
+        raise BadRequest(log_message="HTTP/1.1 request without Host header")
+    return method.upper(), target, version, headers
 
 
 def parse_content_length(headers: dict[str, str], max_body_bytes: int) -> int:
     """解析 Content-Length。
 
-    原代码直接 int(headers.get(...))：
-      - "abc" 抛裸 ValueError，被顶层伪装成 400 并回显内部异常文本；
-      - "-1" 通过 `-1 > MAX_BODY_BYTES` 的检查，且让读 body 的循环一次都不执行，
-        于是声明的长度与实际 body 不符也能被正常处理。
-    isdigit() 同时挡住这两种输入。
+    原代码直接 int(headers.get(...))，"abc" 抛裸 ValueError、"-1" 绕过上限。
+    这里还要处理两类更隐蔽的输入：
+      - str.isdigit() 对 '²'(上标2)、阿拉伯-印度数字等返回 True，但 int() 未必能解析
+        （'²' 会抛 ValueError），故改用 isascii()+isdigit() 只放行 ASCII 0-9；
+      - 头存在但值为空时不能等同于「头不存在」（那会把带 body 的报文当成无 body）；
+      - 超过 4300 位的数字会让 int() 直接抛异常，按位数提前判过大。
     """
     if "transfer-encoding" in headers:
         raise HttpError(
@@ -223,9 +244,14 @@ def parse_content_length(headers: dict[str, str], max_body_bytes: int) -> int:
             log_message=f"unsupported Transfer-Encoding: {headers['transfer-encoding']!r}",
         )
 
-    raw = headers.get("content-length", "0").strip() or "0"
-    if not raw.isdigit():
+    raw = headers.get("content-length")
+    if raw is None:
+        return 0  # 头不存在 = 无 body
+    raw = raw.strip()
+    if not raw or not (raw.isascii() and raw.isdigit()):
         raise BadRequest(log_message=f"invalid Content-Length: {raw!r}")
+    if len(raw) > len(str(max_body_bytes)):
+        raise PayloadTooLarge(log_message=f"Content-Length has too many digits: {len(raw)}")
     length = int(raw)
     if length > max_body_bytes:
         raise PayloadTooLarge(log_message=f"Content-Length {length} exceeds {max_body_bytes}")
