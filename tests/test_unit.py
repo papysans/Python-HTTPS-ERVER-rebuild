@@ -6,7 +6,11 @@
 """
 
 import asyncio
+import json
+import logging
+import runpy
 import socket
+import sys
 
 import pytest
 
@@ -31,7 +35,8 @@ from http_core import (
     parse_head,
     parse_request,
 )
-from http_server import ConnectionHandler, read_request
+import http_server
+from http_server import ConnectionHandler, HttpServer, main, parse_args, read_request, serve
 from sessions import SessionStore
 
 
@@ -592,3 +597,785 @@ def test_unexpected_handler_error_returns_fixed_500_without_leak():
     assert b"internal server error" in raw
     assert b"secret internal detail" not in raw  # 不泄漏异常原文
     assert b"/etc/shadow" not in raw
+
+
+# ==========================================================================
+# 覆盖率补全
+#
+# 以下用例覆盖此前只有功能测试（起真服务、打真端口）才触达、或根本没被
+# 触达的分支。补齐的意义不在于数字：这些分支里有相当一部分是**故障路径**
+# （客户端中途断开、读超时、bind 失败、连接被取消），而故障路径恰恰是
+# 功能测试最难稳定构造、线上又最容易出事的地方。全部改为进程内构造后，
+# 核心逻辑退化在不起进程、不抢端口的前提下即可被发现。
+# ==========================================================================
+
+
+def make_handler(router=None, *, config=None, store=None) -> ConnectionHandler:
+    config = config or ServerConfig()
+    store = store or make_store(FakeClock())
+    return ConnectionHandler(config, router if router is not None else Router(config, store), store)
+
+
+async def handle_raw(handler: ConnectionHandler, raw: bytes) -> bytes:
+    """把 raw 字节喂给 handler，返回它写回的完整响应。
+
+    用 socketpair 代替真 TCP 连接：不占端口，因而不会撞上本机已占用 8080
+    这类环境问题，也不需要 wait_for_server 之类的就绪探测。
+    """
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    try:
+        if raw:
+            right.sendall(raw)
+        await handler.handle(left, ("127.0.0.1", 12345))
+        right.settimeout(2)
+        data = b""
+        while True:
+            chunk = right.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return data
+    finally:
+        right.close()
+        left.close()
+
+
+# --------------------------------------------------------------------------
+# 报文解析：剩余拒绝分支
+# --------------------------------------------------------------------------
+
+
+def test_parse_head_rejects_malformed_request_line():
+    """请求行必须恰好三段，否则解包会越界。"""
+    with pytest.raises(BadRequest):
+        parse_head(b"GET /missing-version\r\nHost: x")
+
+
+def test_parse_head_rejects_header_line_without_colon():
+    with pytest.raises(BadRequest):
+        parse_head(b"GET / HTTP/1.1\r\nHost: x\r\nBanana")
+
+
+# --------------------------------------------------------------------------
+# 会话存储：删除
+# --------------------------------------------------------------------------
+
+
+def test_delete_removes_session_and_tolerates_unknown_id():
+    store = make_store(FakeClock())
+    session_id, _ = store.create()
+
+    store.delete(session_id)
+
+    assert store.get(session_id) is None
+    assert len(store) == 0
+    store.delete("never-existed")  # 不得抛：/logout 可能带着任意 sid 打进来
+
+
+# --------------------------------------------------------------------------
+# 业务纯函数：剩余分支
+# --------------------------------------------------------------------------
+
+
+def test_parse_int_list_skips_empty_items():
+    """"1,,2" 与尾随逗号是表单里的常见形态，空片段应跳过而非报错。"""
+    assert parse_int_list(["1,,2", "  ", "3,"]) == ([1, 2, 3], None)
+
+
+def test_parse_sleep_seconds_accepts_value_within_limit():
+    assert parse_sleep_seconds(["3"], max_seconds=10) == (3, None)
+    assert parse_sleep_seconds(["10"], max_seconds=10) == (10, None)  # 边界值不应被拒
+    assert parse_sleep_seconds(["0"], max_seconds=10) == (0, None)
+
+
+def test_resolve_static_path_maps_directory_root_to_index_html(tmp_path):
+    root = tmp_path / "static"
+    root.mkdir()
+    (root / "index.html").write_text("<h1>hi</h1>")
+
+    assert resolve_static_path(root.resolve(), "/static/") == (root / "index.html").resolve()
+
+
+# --------------------------------------------------------------------------
+# Router：各端点
+# --------------------------------------------------------------------------
+
+
+def test_index_renders_visit_count_and_user():
+    router = make_router([])
+    anonymous = Request("GET", "/", "HTTP/1.1", {}, b"", path="/")
+    anonymous.session = {"visits": 3}
+    logged_in = Request("GET", "/", "HTTP/1.1", {}, b"", path="/")
+    logged_in.session = {"visits": 1, "user": "admin"}
+
+    assert b"Session visits: 3" in dispatch(router, anonymous).body
+    assert b"anonymous" in dispatch(router, anonymous).body
+    assert b"Current user: admin" in dispatch(router, logged_in).body
+
+
+def test_sum_endpoint_reads_any_documented_alias():
+    """SUM_PARAM_ALIASES 是从原代码里考古出来的隐式契约，必须被测试钉住，
+    否则下一次重构会以为只有 numbers 一个参数名而悄悄破坏调用方。
+    """
+    router = make_router([])
+
+    for alias in ("numbers", "nums", "values", "n"):
+        request = Request(
+            "GET", f"/api/v1/sum?{alias}=1,2,3", "HTTP/1.1", {}, b"",
+            path="/api/v1/sum", query={alias: ["1,2,3"]},
+        )
+
+        response = dispatch(router, request)
+
+        assert response.status == 200
+        assert json.loads(response.body) == {"numbers": [1, 2, 3], "result": 6}
+
+
+def test_sum_endpoint_without_params_returns_zero():
+    request = Request("GET", "/api/v1/sum", "HTTP/1.1", {}, b"", path="/api/v1/sum")
+
+    assert json.loads(dispatch(make_router([]), request).body) == {"numbers": [], "result": 0}
+
+
+def test_sum_endpoint_rejects_invalid_integer_with_json_400():
+    request = Request(
+        "POST", "/api/v1/sum", "HTTP/1.1", {}, b"",
+        path="/api/v1/sum", form={"numbers": ["1,two"]},
+    )
+
+    response = dispatch(make_router([]), request)
+
+    assert response.status == 400
+    assert json.loads(response.body) == {"error": "not an integer: two"}
+
+
+def test_sleep_endpoint_sleeps_requested_seconds():
+    sleeps: list = []
+    request = Request(
+        "GET", "/api/v1/sleep", "HTTP/1.1", {}, b"",
+        path="/api/v1/sleep", query={"sec": ["3"]},
+    )
+
+    response = dispatch(make_router(sleeps), request)
+
+    assert json.loads(response.body) == {"sec": 3}
+    assert sleeps == [3]
+
+
+def test_sleep_endpoint_rejects_unsupported_method():
+    sleeps: list = []
+    request = Request("PUT", "/api/v1/sleep", "HTTP/1.1", {}, b"", path="/api/v1/sleep")
+
+    response = dispatch(make_router(sleeps), request)
+
+    assert response.status == 405
+    assert sleeps == []
+
+
+def test_session_api_returns_current_session_snapshot():
+    request = Request(
+        "GET", "/api/v1/session", "HTTP/1.1", {}, b"",
+        path="/api/v1/session", cookies={"sid": "sid-0"},
+    )
+    request.session_id = "sid-0"
+    request.session = {"visits": 2, "user": "admin"}
+
+    payload = json.loads(dispatch(make_router([]), request).body)
+
+    assert payload == {
+        "session_id": "sid-0",
+        "visits": 2,
+        "user": "admin",
+        "cookies": {"sid": "sid-0"},
+    }
+
+
+def test_login_get_returns_form():
+    request = Request("GET", "/login", "HTTP/1.1", {}, b"", path="/login")
+
+    response = dispatch(make_router([]), request)
+
+    assert response.status == 200
+    assert b"<h1>Login</h1>" in response.body
+
+
+def test_login_rejects_unsupported_method():
+    request = Request("DELETE", "/login", "HTTP/1.1", {}, b"", path="/login")
+
+    assert dispatch(make_router([]), request).status == 405
+
+
+def test_login_success_rotates_session_id_and_redirects():
+    """防会话固定：登录成功必须换 sid，且新 sid 要通过 Set-Cookie 下发。
+
+    原代码沿用登录前的 sid，攻击者可预先种一个 sid 诱导受害者登录，
+    随后凭同一个 sid 冒用其已认证会话。
+    """
+    config = ServerConfig()
+    store = make_store(FakeClock())
+    router = Router(config, store)
+    old_id, session = store.create()
+    request = Request(
+        "POST", "/login", "HTTP/1.1", {}, b"",
+        path="/login", form={"username": ["admin"], "password": ["password"]},
+    )
+    request.session_id, request.session = old_id, session
+
+    response = asyncio.run(router.dispatch(request))
+
+    assert response.status == 303
+    assert response.headers["Location"] == "/protected"
+    assert request.session_id != old_id
+    assert store.get(old_id) is None  # 旧 sid 立即失效
+    assert store.get(request.session_id)["user"] == "admin"
+    assert any(cookie.startswith(f"{config.session_cookie}={request.session_id}") for cookie in response.cookies)
+
+
+def test_login_with_wrong_password_returns_401_without_rotating():
+    config = ServerConfig()
+    store = make_store(FakeClock())
+    router = Router(config, store)
+    old_id, session = store.create()
+    request = Request(
+        "POST", "/login", "HTTP/1.1", {}, b"",
+        path="/login", form={"username": ["admin"], "password": ["wrong"]},
+    )
+    request.session_id, request.session = old_id, session
+
+    response = asyncio.run(router.dispatch(request))
+
+    assert response.status == 401
+    assert request.session_id == old_id
+    assert "user" not in session
+
+
+def test_logout_destroys_session_and_expires_cookie():
+    config = ServerConfig()
+    store = make_store(FakeClock())
+    router = Router(config, store)
+    session_id, session = store.create()
+    session["user"] = "admin"
+    request = Request("POST", "/logout", "HTTP/1.1", {}, b"", path="/logout")
+    request.session_id, request.session = session_id, session
+
+    response = asyncio.run(router.dispatch(request))
+
+    assert response.status == 303
+    assert response.headers["Location"] == "/"
+    assert store.get(session_id) is None
+    assert any(cookie.endswith("; Max-Age=0") for cookie in response.cookies)
+
+
+def test_protected_redirects_anonymous_to_login():
+    request = Request("GET", "/protected", "HTTP/1.1", {}, b"", path="/protected")
+
+    response = dispatch(make_router([]), request)
+
+    assert response.status == 303
+    assert response.headers["Location"] == "/login"
+
+
+def test_protected_serves_page_to_logged_in_user():
+    request = Request("GET", "/protected", "HTTP/1.1", {}, b"", path="/protected")
+    request.session = {"user": ServerConfig().username}
+
+    response = dispatch(make_router([]), request)
+
+    assert response.status == 200
+    assert b"You are logged in" in response.body
+
+
+# --------------------------------------------------------------------------
+# Router：静态文件
+# --------------------------------------------------------------------------
+
+
+def make_static_router(root) -> Router:
+    return Router(ServerConfig(static_root=root.resolve()), make_store(FakeClock()))
+
+
+def static_request(path: str) -> Request:
+    return Request("GET", path, "HTTP/1.1", {}, b"", path=path)
+
+
+def test_static_serves_file_with_guessed_content_type(tmp_path):
+    root = tmp_path / "static"
+    root.mkdir()
+    (root / "hello.txt").write_text("hello")
+
+    response = asyncio.run(make_static_router(root).dispatch(static_request("/static/hello.txt")))
+
+    assert response.status == 200
+    assert response.body == b"hello"
+    assert response.headers["Content-Type"].startswith("text/plain")
+
+
+def test_static_falls_back_to_octet_stream_for_unknown_extension(tmp_path):
+    root = tmp_path / "static"
+    root.mkdir()
+    (root / "blob.unknownext").write_bytes(b"\x00\x01")
+
+    response = asyncio.run(
+        make_static_router(root).dispatch(static_request("/static/blob.unknownext"))
+    )
+
+    assert response.headers["Content-Type"] == "application/octet-stream"
+
+
+def test_static_serves_directory_index(tmp_path):
+    root = tmp_path / "static"
+    root.mkdir()
+    (root / "docs").mkdir()
+    (root / "docs" / "index.html").write_text("<h1>docs</h1>")
+
+    response = asyncio.run(make_static_router(root).dispatch(static_request("/static/docs")))
+
+    assert response.status == 200
+    assert b"<h1>docs</h1>" in response.body
+
+
+def test_static_path_escape_returns_403(tmp_path):
+    """路径穿越必须在 router 这一层就被挡下（resolve_static_path 返回 None）。"""
+    root = tmp_path / "static"
+    root.mkdir()
+    (tmp_path / "secret.txt").write_text("TOP SECRET")
+
+    response = asyncio.run(
+        make_static_router(root).dispatch(static_request("/static/../secret.txt"))
+    )
+
+    assert response.status == 403
+    assert b"TOP SECRET" not in response.body
+
+
+def test_static_missing_file_returns_404(tmp_path):
+    root = tmp_path / "static"
+    root.mkdir()
+
+    response = asyncio.run(make_static_router(root).dispatch(static_request("/static/nope.txt")))
+
+    assert response.status == 404
+
+
+def test_static_unreadable_file_returns_500_not_400(tmp_path):
+    """原代码未捕获读文件的 OSError，PermissionError 会被顶层伪装成 400
+    ——把服务端的权限配置错误谎报成客户端请求有问题。
+    """
+    root = tmp_path / "static"
+    root.mkdir()
+    locked = root / "locked.txt"
+    locked.write_text("x")
+    locked.chmod(0o000)
+    try:
+        locked.read_bytes()
+    except OSError:
+        pass
+    else:  # root 用户或 Windows 上 chmod 000 仍可读，无法构造该场景
+        locked.chmod(0o644)
+        pytest.skip("当前环境下 chmod 000 仍可读，跳过")
+
+    try:
+        response = asyncio.run(make_static_router(root).dispatch(static_request("/static/locked.txt")))
+    finally:
+        locked.chmod(0o644)  # 还原，否则 tmp_path 清理可能受阻
+
+    assert response.status == 500
+    assert b"internal server error" in response.body
+
+
+# --------------------------------------------------------------------------
+# read_request：socket 读取边界
+# --------------------------------------------------------------------------
+
+
+def test_read_request_rejects_head_truncated_by_disconnect():
+    """R01：原代码 recv 返回空时直接 break，再凭空补上客户端从未发送的
+    CRLFCRLF，于是半个请求会被当成完整请求正常服务。
+    """
+
+    async def drive() -> None:
+        left, right = socket.socketpair()
+        left.setblocking(False)
+        right.sendall(b"GET / HTTP/1.1\r\nHost: x")  # 无终止符就断开
+        right.close()
+        try:
+            with pytest.raises(BadRequest):
+                await read_request(left, ServerConfig())
+        finally:
+            left.close()
+
+    asyncio.run(drive())
+
+
+def test_read_request_rejects_complete_but_oversized_head():
+    """头部带终止符、但长度超限时仍须 431（与「无终止符」是两条不同分支）。"""
+
+    async def drive() -> None:
+        left, right = socket.socketpair()
+        left.setblocking(False)
+        head = b"GET / HTTP/1.1\r\nHost: x\r\nX-Big: " + b"A" * 200 + b"\r\n\r\n"
+        right.sendall(head)
+        try:
+            with pytest.raises(HttpError) as excinfo:
+                await read_request(left, ServerConfig(max_header_bytes=100))
+            assert excinfo.value.status == 431
+        finally:
+            right.close()
+            left.close()
+
+    asyncio.run(drive())
+
+
+def test_read_request_waits_for_body_arriving_in_a_later_packet():
+    """body 与 head 分包到达是 TCP 的常态，不能只读一次就以为拿全了。"""
+
+    async def drive() -> None:
+        left, right = socket.socketpair()
+        left.setblocking(False)
+        task = asyncio.create_task(read_request(left, ServerConfig()))
+        head = (
+            b"POST /api/v1/sum HTTP/1.1\r\nHost: x\r\n"
+            b"Content-Type: application/x-www-form-urlencoded\r\n"
+            b"Content-Length: 11\r\n\r\n"
+        )
+        right.sendall(head)
+        await asyncio.sleep(0.05)  # 让 read_request 先把头部消费掉
+        right.sendall(b"numbers=1,2")
+        try:
+            request = await asyncio.wait_for(task, timeout=2)
+            assert request.form == {"numbers": ["1,2"]}
+        finally:
+            right.close()
+            left.close()
+
+    asyncio.run(drive())
+
+
+def test_read_request_rejects_body_truncated_by_disconnect():
+    """body 不足声明长度时必须拒绝，不能静默服务残缺 body。"""
+
+    async def drive() -> None:
+        left, right = socket.socketpair()
+        left.setblocking(False)
+        right.sendall(
+            b"POST /api/v1/sum HTTP/1.1\r\nHost: x\r\nContent-Length: 40\r\n\r\nshort"
+        )
+        right.close()
+        try:
+            with pytest.raises(BadRequest):
+                await read_request(left, ServerConfig())
+        finally:
+            left.close()
+
+    asyncio.run(drive())
+
+
+# --------------------------------------------------------------------------
+# ConnectionHandler：故障路径
+# --------------------------------------------------------------------------
+
+
+def test_read_timeout_returns_408():
+    """原代码读 socket 无任何超时，半开连接可永久占用 task 与 fd（slowloris）。"""
+    handler = make_handler(config=ServerConfig(read_timeout_seconds=0.05))
+
+    raw = asyncio.run(handle_raw(handler, b""))  # 连上就不说话
+
+    assert b"408 Request Timeout" in raw
+
+
+def test_malformed_request_is_answered_with_its_own_status():
+    """解析层抛出的 HttpError 必须按自带状态码回，而不是统统 400。"""
+    raw = asyncio.run(handle_raw(make_handler(), b"GET / BANANA/9.9\r\nHost: x\r\n\r\n"))
+
+    assert b"505 HTTP Version Not Supported" in raw
+
+
+def test_http_error_raised_by_router_is_mapped_to_its_status():
+    class RaisingRouter:
+        async def dispatch(self, request):
+            raise PayloadTooLarge(log_message="内部细节不该外泄")
+
+    raw = asyncio.run(
+        handle_raw(make_handler(RaisingRouter()), b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    )
+
+    assert b"413 Payload Too Large" in raw
+    assert b"payload too large" in raw
+    assert "内部细节不该外泄".encode() not in raw  # log_message 只进日志
+
+
+def test_unexpected_error_while_reading_request_returns_500(monkeypatch):
+    """读请求阶段的意外异常（非 HttpError/超时）必须兜成 500 并把响应发出去，
+    而不是让异常穿透整个连接处理、让客户端拿到一个空响应。
+    """
+
+    async def boom(client, config):
+        raise RuntimeError("unexpected read failure")
+
+    monkeypatch.setattr(http_server, "read_request", boom)
+
+    raw = asyncio.run(handle_raw(make_handler(), b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+
+    assert b"500 Internal Server Error" in raw
+    assert b"unexpected read failure" not in raw
+
+
+def test_client_disconnect_before_response_is_logged_not_raised(caplog):
+    """客户端发完就走是日常现象，不该让连接处理抛异常。"""
+
+    async def drive() -> None:
+        left, right = socket.socketpair()
+        left.setblocking(False)
+        right.sendall(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+        right.close()  # 响应还没写就断开
+        try:
+            await make_handler().handle(left, ("127.0.0.1", 12345))
+        finally:
+            left.close()
+
+    with caplog.at_level(logging.WARNING, logger="http_server"):
+        asyncio.run(drive())
+
+    assert "failed to send response" in caplog.text
+
+
+def test_cancelled_connection_still_closes_its_socket():
+    """CancelledError 不是 Exception：关停/重启时若 close 只写在 except 里，
+    被取消的连接会漏 fd。这里断言 socket 在取消路径上依然被关闭。
+    """
+
+    async def drive() -> socket.socket:
+        left, right = socket.socketpair()
+        left.setblocking(False)
+        handler = make_handler(config=ServerConfig(read_timeout_seconds=30))
+        task = asyncio.create_task(handler.handle(left, ("127.0.0.1", 12345)))
+        await asyncio.sleep(0.05)  # 让它进入读等待
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        right.close()
+        return left
+
+    left = asyncio.run(drive())
+
+    assert left.fileno() == -1  # fd 已释放
+
+
+def test_existing_session_cookie_is_reused_and_touched():
+    """带着有效 sid 的请求必须复用会话并续期，而不是每次新建一个。"""
+    config = ServerConfig()
+    store = make_store(FakeClock())
+    handler = ConnectionHandler(config, Router(config, store), store)
+    session_id, _ = store.create()
+    request = (
+        b"GET /api/v1/session HTTP/1.1\r\nHost: x\r\n"
+        b"Cookie: sid=" + session_id.encode() + b"\r\n\r\n"
+    )
+
+    raw = asyncio.run(handle_raw(handler, request))
+
+    payload = json.loads(raw.partition(b"\r\n\r\n")[2])
+    assert payload["session_id"] == session_id
+    assert payload["visits"] == 1
+    assert len(store) == 1  # 没有凭空多出一个会话
+
+
+# --------------------------------------------------------------------------
+# HttpServer：启停
+# --------------------------------------------------------------------------
+
+
+def test_start_binds_ephemeral_port_and_close_releases_it():
+    """port=0 让内核分配端口，是「测试不再争抢固定 8080」的前提。"""
+
+    async def drive() -> None:
+        server = HttpServer(ServerConfig(port=0))
+        host, port = server.start()
+        try:
+            assert host == "127.0.0.1"
+            assert port != 0
+        finally:
+            await server.close()
+        assert server._socket is None
+
+    asyncio.run(drive())
+
+
+def test_start_reports_readable_error_when_port_is_taken():
+    """这正是 8080 被别的进程占用时的场景：必须给出一句能看懂的 bind 失败，
+    而不是原代码那样甩一堆 asyncio 栈帧，让人误判成代码 bug。
+    """
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen()
+    taken_port = blocker.getsockname()[1]
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            HttpServer(ServerConfig(port=taken_port)).start()
+        assert "cannot bind" in str(excinfo.value)
+        assert str(taken_port) in str(excinfo.value)
+    finally:
+        blocker.close()
+
+
+def test_serve_forever_accepts_connections_and_responds():
+    async def drive() -> None:
+        server = HttpServer(ServerConfig(port=0))
+        host, port = server.start()
+        task = asyncio.create_task(server.serve_forever())
+        loop = asyncio.get_running_loop()
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.setblocking(False)
+        try:
+            await loop.sock_connect(client, (host, port))
+            await loop.sock_sendall(client, b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            data = b""
+            while True:
+                chunk = await loop.sock_recv(client, 4096)
+                if not chunk:
+                    break
+                data += chunk
+            assert b"200 OK" in data
+        finally:
+            client.close()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert server._socket is None  # 取消后 listening socket 已释放
+
+    asyncio.run(asyncio.wait_for(drive(), timeout=10))
+
+
+def test_close_cancels_in_flight_connections():
+    """关停时必须取消仍在处理中的连接，否则这些 task 与 fd 会残留。"""
+
+    async def drive() -> None:
+        server = HttpServer(ServerConfig(port=0, read_timeout_seconds=30))
+        host, port = server.start()
+        task = asyncio.create_task(server.serve_forever())
+        loop = asyncio.get_running_loop()
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        client.setblocking(False)
+        try:
+            await loop.sock_connect(client, (host, port))
+            for _ in range(200):  # 等服务端 accept 并把 handler 挂进 _pending
+                if server._pending:
+                    break
+                await asyncio.sleep(0.01)
+            assert server._pending, "服务端未受理连接"
+            in_flight = next(iter(server._pending))
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert in_flight.cancelled()
+        finally:
+            client.close()
+
+    asyncio.run(asyncio.wait_for(drive(), timeout=10))
+
+
+def test_serve_forever_drops_client_it_cannot_configure(monkeypatch):
+    """accept 成功但 setblocking 失败（fd 已失效）时，必须关掉这条连接、
+    归还并发许可并继续服务——不能泄漏 fd，更不能让整个 accept 循环挂掉。
+    """
+
+    class StopAccepting(Exception):
+        pass
+
+    class BrokenClient:
+        def __init__(self):
+            self.closed = False
+
+        def setblocking(self, flag):
+            raise OSError("bad file descriptor")
+
+        def close(self):
+            self.closed = True
+
+    broken = BrokenClient()
+
+    async def drive() -> None:
+        server = HttpServer(ServerConfig(port=0, max_concurrent_connections=1))
+        server.start()
+        loop = asyncio.get_running_loop()
+        pending_clients = [broken]
+
+        async def fake_accept(sock):
+            if pending_clients:
+                return pending_clients.pop(), ("127.0.0.1", 5555)
+            raise StopAccepting  # 第二轮：证明许可已归还，循环仍在转
+
+        monkeypatch.setattr(loop, "sock_accept", fake_accept)
+
+        with pytest.raises(StopAccepting):
+            await server.serve_forever()
+
+    asyncio.run(asyncio.wait_for(drive(), timeout=10))
+
+    assert broken.closed  # fd 未泄漏
+
+
+def test_serve_starts_a_server_and_stops_on_cancel():
+    async def drive() -> None:
+        task = asyncio.create_task(serve(ServerConfig(port=0)))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(asyncio.wait_for(drive(), timeout=10))
+
+
+# --------------------------------------------------------------------------
+# 命令行入口
+# --------------------------------------------------------------------------
+
+
+def test_parse_args_maps_cli_flags_to_config():
+    config = parse_args(["--host", "0.0.0.0", "--port", "0", "--log-level", "warning"])
+
+    assert config.host == "0.0.0.0"
+    assert config.port == 0
+
+
+def test_parse_args_defaults_match_server_config():
+    config = parse_args([])
+
+    assert config.host == ServerConfig.host
+    assert config.port == ServerConfig.port
+
+
+def test_parse_args_tolerates_unknown_log_level():
+    """未知级别退回 INFO，而不是让进程带着 AttributeError 起不来。"""
+    assert parse_args(["--log-level", "banana"]).port == ServerConfig.port
+
+
+def patch_entrypoint(monkeypatch) -> None:
+    """让 main() 走完整条路径但不真的起服务：asyncio.run 立刻抛 KeyboardInterrupt。"""
+    monkeypatch.setattr(sys, "argv", ["http_server.py", "--port", "0"])
+
+    def fake_run(coro):
+        coro.close()  # 避免 "coroutine was never awaited"
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(asyncio, "run", fake_run)
+
+
+def test_main_exits_quietly_on_keyboard_interrupt(monkeypatch, caplog):
+    """Ctrl-C 是正常的停服方式，不该给运维甩一段 traceback。"""
+    patch_entrypoint(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="http_server"):
+        main()  # 不得抛
+
+    assert "stopped" in caplog.text
+
+
+def test_module_runs_as_a_script(monkeypatch):
+    """`python http_server.py` 是文档里写的用法，__main__ 入口必须真的可执行。"""
+    patch_entrypoint(monkeypatch)
+
+    runpy.run_path(http_server.__file__, run_name="__main__")  # 不得抛
